@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "erruviel.docker",
-  "name": "Docker",
+  "name": "OmiDocker",
   "version": "1.1.0",
   "author": "Erruviel",
   "license": "MIT",
@@ -13,7 +13,7 @@
     "barWidget": "shell/DockerPanel.qml"
   },
   "barWidget": {
-    "displayName": "Docker",
+    "displayName": "OmiDocker",
     "description": "Container status with a popup panel: compose stacks, ports, start/stop controls",
     "category": "System",
     "allowMultiple": false,
