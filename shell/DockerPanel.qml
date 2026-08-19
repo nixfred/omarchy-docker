@@ -169,6 +169,25 @@ Panel {
     runAction(["docker", start ? "start" : "stop"].concat(ids))
   }
 
+  // Removal is destructive, so it goes through a confirm dialog first. Only
+  // stopped containers offer it — a running one has to be stopped first,
+  // which keeps an accidental click from force-killing a live service.
+  property var pendingRemove: null
+
+  function requestRemove(c) {
+    if (busyId !== "" || daemonBusy || !daemonRunning) return
+    pendingRemove = { id: c.id, name: c.name }
+  }
+
+  function confirmRemove() {
+    if (!pendingRemove) return
+    busyId = pendingRemove.id
+    runAction(["docker", "rm", pendingRemove.id])
+    pendingRemove = null
+  }
+
+  onOpenedChanged: if (!opened) pendingRemove = null
+
   // The daemon switch: plain systemctl as the user — polkit prompts through
   // the shell's own agent. No rules or privileged helpers shipped.
   function toggleDaemon() {
@@ -419,6 +438,16 @@ Panel {
           font.pixelSize: Style.font.bodySmall
         }
       }
+
+      ConfirmDialog {
+        anchors.fill: parent
+        opened: root.pendingRemove !== null
+        message: "Remove container " + (root.pendingRemove ? root.pendingRemove.name : "") + "? Its writable layer is deleted; named volumes are kept."
+        confirmText: "Remove"
+        fontFamily: root.fontFamily
+        onConfirmed: root.confirmRemove()
+        onCanceled: root.pendingRemove = null
+      }
     }
   }
 
@@ -516,6 +545,18 @@ Panel {
           foreground: root.barForeground
           fontFamily: root.fontFamily
           onClicked: root.containerAction(row.container, "restart")
+        }
+
+        Button {
+          visible: !row.running
+          iconText: "󰩺"
+          tooltipText: "Remove"
+          fontSize: Style.font.caption
+          bordered: true
+          enabled: root.daemonRunning && !row.rowBusy && root.busyId === ""
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.requestRemove(row.container)
         }
 
         Button {
