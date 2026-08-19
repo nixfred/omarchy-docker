@@ -1,0 +1,52 @@
+#!/bin/bash
+# Emit the whole panel state as one JSON document on stdout — one process
+# spawn per refresh, mirroring how erruviel.wwan feeds its panel. Runs
+# entirely unprivileged: daemon access comes from the user's docker group
+# membership, and this script never elevates.
+set -o pipefail
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo '{"installed":false,"daemon":"stopped","containers":[]}'
+  exit 0
+fi
+
+ids=$(docker ps -aq 2>&1)
+if (( $? != 0 )); then
+  # The daemon is down, or the socket refused us. Tell the panel which, so
+  # it can offer the right fix (start the daemon vs. join the docker group).
+  case "$ids" in
+  *[Pp]ermission\ denied*) daemon="noaccess" ;;
+  *) daemon="stopped" ;;
+  esac
+  printf '{"installed":true,"daemon":"%s","containers":[]}\n' "$daemon"
+  exit 0
+fi
+
+if [[ -z $ids ]]; then
+  echo '{"installed":true,"daemon":"running","containers":[]}'
+  exit 0
+fi
+
+# One inspect call for every container. IDs are hex from docker itself, so
+# the unquoted expansion only ever word-splits on the newlines between them.
+# shellcheck disable=SC2086
+docker inspect $ids 2>/dev/null | jq -c '{
+  installed: true,
+  daemon: "running",
+  containers: map({
+    id: .Id[0:12],
+    name: (.Name | ltrimstr("/")),
+    service: (.Config.Labels["com.docker.compose.service"] // ""),
+    project: (.Config.Labels["com.docker.compose.project"] // ""),
+    image: .Config.Image,
+    state: .State.Status,
+    health: (if .State.Status == "running" then (.State.Health.Status // "") else "" end),
+    ports: ([ (.HostConfig.PortBindings // {})
+              | to_entries[]
+              | .key as $cport
+              | (.value // [])[]
+              | select((.HostPort // "") != "")
+              | {host: .HostPort, container: $cport} ]
+            | unique)
+  })
+}'

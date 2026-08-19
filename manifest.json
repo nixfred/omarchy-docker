@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "erruviel.docker",
+  "name": "Docker",
+  "version": "1.0.0",
+  "author": "Erruviel",
+  "license": "MIT",
+  "description": "Docker containers and compose stacks for Omarchy",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "shell/DockerPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "Docker",
+    "description": "Container status with a popup panel: compose stacks, ports, start/stop controls",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
