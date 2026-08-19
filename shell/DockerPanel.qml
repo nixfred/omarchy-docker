@@ -7,11 +7,13 @@ import qs.Ui
 // Docker bar widget with an anchored popup panel, following the same pattern
 // as erruviel.wwan: all state comes from `bin/docker-panel` — one process
 // spawn per refresh — with `docker events` streaming in the background so
-// external changes show up without waiting for the next poll.
+// external changes show up without waiting for the next poll. The open panel
+// switches to a verbose feed (adds `docker system df`) and samples
+// per-container CPU/memory; the closed widget pays for neither.
 //
 // Everything here runs unprivileged. Container actions go through the docker
-// CLI (docker group membership), and the daemon switch calls systemctl as the
-// user, which authenticates through the shell's polkit agent.
+// CLI (docker group membership), and the daemon/autostart switches call
+// systemctl as the user, which authenticates through the shell's polkit agent.
 Panel {
   id: root
   moduleName: "erruviel.docker"
@@ -31,9 +33,17 @@ Panel {
   readonly property string daemonState: info.daemon || "stopped"
   readonly property bool daemonRunning: daemonState === "running"
   readonly property bool daemonBusy: daemonProc.running
+  readonly property string autostart: info.autostart || ""
+  readonly property var dfInfo: info.df || null
+
+  readonly property bool showCount: setting("showCount", false) === true
+  readonly property bool notifyUnhealthy: setting("notifyUnhealthy", true) !== false
 
   // One action in flight at a time; the affected row dims while it runs.
   property string busyId: ""
+
+  // Per-container CPU/memory, sampled only while the panel is open.
+  property var stats: ({})
 
   // ------------------------------------------------------------- grouping ---
   // Containers grouped into compose stacks and standalone, with port-conflict
@@ -59,7 +69,9 @@ Panel {
         image: c.image || "",
         state: c.state,
         health: c.health || "",
-        portsLabel: formatPorts(c.ports || []),
+        workingDir: c.workingDir || "",
+        configFiles: c.configFiles || "",
+        portsList: portEntries(c.ports || []),
         note: ""
       }
       if (c.state !== "running") {
@@ -110,16 +122,35 @@ Panel {
     return s
   }
 
-  function formatPorts(ports) {
+  // What `docker image prune && docker builder prune` would get back. The
+  // deliberately narrow scope keeps the clean-up away from stopped compose
+  // containers, which around here are parked stacks, not garbage.
+  readonly property string reclaimText: {
+    if (!dfInfo) return ""
+    var images = "", cache = ""
+    for (var i = 0; i < dfInfo.length; i++) {
+      var r = (dfInfo[i].reclaimable || "").split(" (")[0]
+      if (dfInfo[i].type === "Images") images = r
+      else if (dfInfo[i].type === "Build Cache") cache = r
+    }
+    if (!images && !cache) return ""
+    return "Reclaimable: " + (images || "0B") + " images · " + (cache || "0B") + " build cache"
+  }
+
+  function portEntries(ports) {
     var out = []
     for (var i = 0; i < ports.length; i++) {
       var host = ports[i].host
       var cont = ports[i].container || ""
-      var proto = cont.indexOf("/udp") >= 0 ? "/udp" : ""
+      var udp = cont.indexOf("/udp") >= 0
       cont = cont.split("/")[0]
-      out.push((host === cont ? host : host + "→" + cont) + proto)
+      out.push({
+        label: (host === cont ? host : host + "→" + cont) + (udp ? "/udp" : ""),
+        host: host,
+        web: !udp
+      })
     }
-    return out.join(" ")
+    return out
   }
 
   function stackRunning(stack) {
@@ -134,6 +165,10 @@ Panel {
     if (!statusProc.running) statusProc.running = true
   }
 
+  function refreshDetails() {
+    if (!detailsProc.running) detailsProc.running = true
+  }
+
   function updateInfo(raw) {
     // Keep the last known state across a transient bad read, so the widget
     // never blinks out while docker is briefly unavailable.
@@ -141,6 +176,19 @@ Panel {
       var next = JSON.parse(raw)
       if (next && typeof next === "object") info = next
     } catch (e) {}
+  }
+
+  function updateStats(raw) {
+    var next = {}
+    var lines = String(raw || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+      if (!lines[i]) continue
+      try {
+        var s = JSON.parse(lines[i])
+        if (s.ID) next[s.ID] = { cpu: s.CPUPerc || "", mem: (s.MemUsage || "").split(" /")[0] }
+      } catch (e) {}
+    }
+    stats = next
   }
 
   // -------------------------------------------------------------- actions ---
@@ -157,11 +205,29 @@ Panel {
     else runAction(["docker", action, c.id])
   }
 
+  // Stack start goes through compose when the labels carry the project
+  // location: unlike `docker start`, `compose up -d` recreates removed
+  // containers and picks up compose.yml changes. Stop stays plain
+  // `docker stop` on purpose — `compose down` would delete the containers.
   function stackAction(stack, start) {
     if (busyId !== "" || daemonBusy || !daemonRunning) return
+    var i, c
+    if (start) {
+      for (i = 0; i < stack.containers.length; i++) {
+        c = stack.containers[i]
+        if (!c.workingDir) continue
+        var cmd = ["docker", "compose", "--project-directory", c.workingDir]
+        var files = (c.configFiles || "").split(",")
+        for (var f = 0; f < files.length; f++) if (files[f]) cmd.push("-f", files[f])
+        cmd.push("up", "-d")
+        busyId = "stack:" + stack.name
+        runAction(cmd)
+        return
+      }
+    }
     var ids = []
-    for (var i = 0; i < stack.containers.length; i++) {
-      var c = stack.containers[i]
+    for (i = 0; i < stack.containers.length; i++) {
+      c = stack.containers[i]
       if (start !== (c.state === "running")) ids.push(c.id)
     }
     if (ids.length === 0) return
@@ -169,24 +235,61 @@ Panel {
     runAction(["docker", start ? "start" : "stop"].concat(ids))
   }
 
-  // Removal is destructive, so it goes through a confirm dialog first. Only
-  // stopped containers offer it — a running one has to be stopped first,
-  // which keeps an accidental click from force-killing a live service.
-  property var pendingRemove: null
+  // Destructive actions share one confirm dialog. Removal is only offered
+  // for stopped containers — a running one has to be stopped first, which
+  // keeps an accidental click from force-killing a live service.
+  property var pendingConfirm: null
+
+  function requestConfirm(message, confirmText, cmd, busyKey) {
+    if (busyId !== "" || daemonBusy || !daemonRunning) return
+    pendingConfirm = { message: message, confirmText: confirmText, cmd: cmd, busyKey: busyKey }
+  }
+
+  function acceptConfirm() {
+    if (!pendingConfirm) return
+    busyId = pendingConfirm.busyKey
+    runAction(pendingConfirm.cmd)
+    pendingConfirm = null
+  }
 
   function requestRemove(c) {
-    if (busyId !== "" || daemonBusy || !daemonRunning) return
-    pendingRemove = { id: c.id, name: c.name }
+    requestConfirm(
+      "Remove container " + c.name + "? Its writable layer is deleted; named volumes are kept.",
+      "Remove", ["docker", "rm", c.id], c.id)
   }
 
-  function confirmRemove() {
-    if (!pendingRemove) return
-    busyId = pendingRemove.id
-    runAction(["docker", "rm", pendingRemove.id])
-    pendingRemove = null
+  function requestPrune() {
+    requestConfirm(
+      "Remove dangling images and build cache? Stopped containers and volumes are kept.",
+      "Clean up", ["bash", "-c", "docker image prune -f && docker builder prune -f"], "prune")
   }
 
-  onOpenedChanged: if (!opened) pendingRemove = null
+  onOpenedChanged: {
+    if (!opened) {
+      pendingConfirm = null
+      stats = {}
+    }
+  }
+
+  // Flows that open their own UI (floating terminals, the browser) — the
+  // panel gets out of their way first. IDs are docker-issued hex, safe to
+  // splice into the command line.
+  function runDetached(cmd) {
+    root.close()
+    if (root.bar) root.bar.run(cmd)
+  }
+
+  function showLogs(c) {
+    runDetached("omarchy-launch-floating-terminal-with-presentation 'docker logs --tail 200 -f " + c.id + "'")
+  }
+
+  function openShell(c) {
+    runDetached("omarchy-launch-floating-terminal-with-presentation 'docker exec -it " + c.id + " sh'")
+  }
+
+  function openPort(host) {
+    runDetached("xdg-open http://localhost:" + host)
+  }
 
   // The daemon switch: plain systemctl as the user — polkit prompts through
   // the shell's own agent. No rules or privileged helpers shipped.
@@ -196,6 +299,12 @@ Panel {
       ? ["systemctl", "stop", "docker.service", "docker.socket"]
       : ["systemctl", "start", "docker.service"]
     daemonProc.running = true
+  }
+
+  function toggleAutostart() {
+    if (autostartProc.running) return
+    autostartProc.command = ["systemctl", autostart === "enabled" ? "disable" : "enable", "docker.service"]
+    autostartProc.running = true
   }
 
   visible: installed
@@ -208,9 +317,26 @@ Panel {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateInfo(text) }
   }
 
+  // The verbose feed adds `docker system df` for the clean-up section; only
+  // the open panel pays for it.
+  Process {
+    id: detailsProc
+    command: [root.panelScript, "--verbose"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateInfo(text) }
+  }
+
+  Process {
+    id: statsProc
+    command: ["docker", "stats", "--no-stream", "--format", "{{json .}}"]
+    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateStats(text) }
+  }
+
   Process {
     id: actionProc
-    onExited: { root.busyId = ""; root.refresh() }
+    onExited: {
+      root.busyId = ""
+      root.opened ? root.refreshDetails() : root.refresh()
+    }
   }
 
   Process {
@@ -218,20 +344,42 @@ Panel {
     onExited: root.refresh()
   }
 
+  Process {
+    id: autostartProc
+    onExited: root.refresh()
+  }
+
   // Push-based refresh: any container event triggers a debounced re-read, so
   // work done in a terminal (compose up, stops, health flips) shows up live.
+  // A health flip to unhealthy additionally raises a desktop notification.
   Process {
     id: eventsProc
     running: root.daemonRunning
-    command: ["docker", "events", "--format", "{{.Status}}", "--filter", "type=container"]
-    stdout: SplitParser { onRead: eventDebounce.restart() }
+    command: ["docker", "events", "--format", "{{json .}}", "--filter", "type=container"]
+    stdout: SplitParser {
+      onRead: function(data) { root.handleEvent(data) }
+    }
     onExited: root.refresh()
+  }
+
+  function handleEvent(line) {
+    eventDebounce.restart()
+    if (!notifyUnhealthy) return
+    try {
+      var ev = JSON.parse(line)
+      if (ev.Action !== "health_status: unhealthy") return
+      var name = ev.Actor && ev.Actor.Attributes && ev.Actor.Attributes.name
+        ? ev.Actor.Attributes.name
+        : String(ev.Actor && ev.Actor.ID || "").slice(0, 12)
+      Quickshell.execDetached(["notify-send", "-u", "critical", "-a", "Docker",
+                               "Container unhealthy", name + " is failing its health check"])
+    } catch (e) {}
   }
 
   Timer {
     id: eventDebounce
     interval: 300
-    onTriggered: root.refresh()
+    onTriggered: root.opened ? root.refreshDetails() : root.refresh()
   }
 
   // Background poll as a safety net (daemon flips, group membership, events
@@ -249,7 +397,17 @@ Panel {
     running: root.opened
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: root.refreshDetails()
+  }
+
+  // `docker stats --no-stream` samples for about a second on its own, so it
+  // gets a slower cadence and its own process.
+  Timer {
+    interval: 3000
+    running: root.opened && root.daemonRunning
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: if (!statsProc.running) statsProc.running = true
   }
 
   // ------------------------------------------------------------------ bar ---
@@ -257,9 +415,12 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰡨"
+    text: root.showCount && root.daemonRunning && root.runningCount > 0
+      ? "󰡨 " + root.runningCount : "󰡨"
     opacity: root.daemonRunning && root.runningCount > 0 ? 1 : 0.5
-    slotSize: Style.bar.statusSlot
+    // The optional count needs natural width; the bare glyph keeps the
+    // fixed status slot like its first-party neighbours.
+    slotSize: root.showCount ? -1 : Style.bar.statusSlot
     // Tooltip suppressed because the panel is the detail view.
     tooltipText: ""
     onPressed: function(b) {
@@ -289,7 +450,7 @@ Panel {
     bar: root.bar
     open: root.opened && root.installed
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(360))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -298,11 +459,19 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Column {
+      // The card caps at screen height; anything past that scrolls.
+      Flickable {
+        id: scroller
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        interactive: contentHeight > height
+
+        Column {
         id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
+        width: scroller.width
         spacing: Style.space(14)
 
         // ---------- Hero: whale · status · daemon switch ----------
@@ -437,21 +606,86 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
         }
+
+        // ---------- Clean up ----------
+        PanelSeparator {
+          visible: root.daemonRunning && root.reclaimText !== ""
+          foreground: root.barForeground
+        }
+
+        Column {
+          visible: root.daemonRunning && root.reclaimText !== ""
+          width: parent.width
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(cleanupHeader.implicitHeight, pruneButton.implicitHeight)
+
+            PanelSectionHeader {
+              id: cleanupHeader
+              text: "CLEAN UP"
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+            }
+
+            Button {
+              id: pruneButton
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              iconText: "󰃢"
+              text: "Prune"
+              tooltipText: "Remove dangling images and build cache"
+              fontSize: Style.font.caption
+              bordered: true
+              enabled: root.busyId === ""
+              opacity: root.busyId === "prune" ? 0.5 : 1
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+              onClicked: root.requestPrune()
+            }
+          }
+
+          Text {
+            width: parent.width
+            text: root.reclaimText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        // ---------- Autostart ----------
+        PanelSeparator { foreground: root.barForeground }
+
+        Toggle {
+          width: parent.width
+          label: "Start at boot"
+          description: "Enable docker.service at system boot"
+          checked: root.autostart === "enabled"
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.toggleAutostart()
+        }
+        }
       }
 
       ConfirmDialog {
         anchors.fill: parent
-        opened: root.pendingRemove !== null
-        message: "Remove container " + (root.pendingRemove ? root.pendingRemove.name : "") + "? Its writable layer is deleted; named volumes are kept."
-        confirmText: "Remove"
+        opened: root.pendingConfirm !== null
+        message: root.pendingConfirm ? root.pendingConfirm.message : ""
+        confirmText: root.pendingConfirm ? root.pendingConfirm.confirmText : "Confirm"
         fontFamily: root.fontFamily
-        onConfirmed: root.confirmRemove()
-        onCanceled: root.pendingRemove = null
+        onConfirmed: root.acceptConfirm()
+        onCanceled: root.pendingConfirm = null
       }
     }
   }
 
-  // One container line: status dot · name + image · ports · actions.
+  // One container line: status dot · name + image/stats · ports · actions.
+  // Ports open in the browser; logs and a shell open detached terminals.
   // A stopped container with a port-conflict note renders it in urgent below.
   component ContainerRow: Column {
     id: row
@@ -462,6 +696,7 @@ Panel {
     readonly property bool paused: container.state === "paused"
     readonly property bool unhealthy: container.health === "unhealthy"
     readonly property bool rowBusy: root.busyId === container.id || groupBusy
+    readonly property var stat: root.stats[container.id] || null
     readonly property string detail: {
       if (unhealthy) return "unhealthy"
       if (container.health === "starting") return "starting"
@@ -494,7 +729,7 @@ Panel {
         id: nameCol
         anchors.left: statusDot.right
         anchors.leftMargin: Style.space(10)
-        anchors.right: portsText.left
+        anchors.right: portsRow.left
         anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
         spacing: 0
@@ -511,22 +746,43 @@ Panel {
         Text {
           width: parent.width
           elide: Text.ElideRight
-          text: (row.container.image || "") + (row.detail ? "  ·  " + row.detail : "")
+          text: (row.container.image || "")
+                + (row.running && row.stat ? "  ·  " + row.stat.cpu + "  ·  " + row.stat.mem : "")
+                + (row.detail ? "  ·  " + row.detail : "")
           color: row.unhealthy ? root.urgent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }
       }
 
-      Text {
-        id: portsText
+      Row {
+        id: portsRow
         anchors.right: actions.left
         anchors.rightMargin: Style.space(10)
         anchors.verticalCenter: parent.verticalCenter
-        text: row.container.portsLabel || ""
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
+        spacing: Style.space(6)
+
+        Repeater {
+          model: row.container.portsList || []
+
+          Text {
+            id: portText
+            required property var modelData
+            text: modelData.label
+            color: portArea.containsMouse ? root.barForeground : root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+
+            MouseArea {
+              id: portArea
+              anchors.fill: parent
+              enabled: portText.modelData.web && row.running
+              hoverEnabled: true
+              cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+              onClicked: root.openPort(portText.modelData.host)
+            }
+          }
+        }
       }
 
       Row {
@@ -535,16 +791,24 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(4)
 
+        // Logs and shell are flat icons: read-only doors, not state changes.
         Button {
-          visible: row.running
-          iconText: "󰜉"
-          tooltipText: "Restart"
+          iconText: "󰈙"
+          tooltipText: "Logs"
           fontSize: Style.font.caption
-          bordered: true
-          enabled: root.daemonRunning && !row.rowBusy && root.busyId === ""
           foreground: root.barForeground
           fontFamily: root.fontFamily
-          onClicked: root.containerAction(row.container, "restart")
+          onClicked: root.showLogs(row.container)
+        }
+
+        Button {
+          visible: row.running
+          iconText: "󰆍"
+          tooltipText: "Shell"
+          fontSize: Style.font.caption
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.openShell(row.container)
         }
 
         Button {
@@ -557,6 +821,18 @@ Panel {
           foreground: root.barForeground
           fontFamily: root.fontFamily
           onClicked: root.requestRemove(row.container)
+        }
+
+        Button {
+          visible: row.running
+          iconText: "󰜉"
+          tooltipText: "Restart"
+          fontSize: Style.font.caption
+          bordered: true
+          enabled: root.daemonRunning && !row.rowBusy && root.busyId === ""
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.containerAction(row.container, "restart")
         }
 
         Button {

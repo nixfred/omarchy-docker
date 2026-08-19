@@ -3,10 +3,24 @@
 # spawn per refresh, mirroring how erruviel.wwan feeds its panel. Runs
 # entirely unprivileged: daemon access comes from the user's docker group
 # membership, and this script never elevates.
+#
+# --verbose additionally runs `docker system df` for the clean-up section;
+# only the open panel pays for that.
 set -o pipefail
 
+verbose=0
+[[ ${1:-} == "--verbose" ]] && verbose=1
+
+# Whether docker.service starts at boot; cheap and daemon-independent.
+autostart=$(systemctl is-enabled docker.service 2>/dev/null || true)
+
+emit_bare() {
+  jq -nc --arg installed "$1" --arg daemon "$2" --arg autostart "$autostart" \
+    '{installed: ($installed == "true"), daemon: $daemon, autostart: $autostart, df: null, containers: []}'
+}
+
 if ! command -v docker >/dev/null 2>&1; then
-  echo '{"installed":false,"daemon":"stopped","containers":[]}'
+  emit_bare false stopped
   exit 0
 fi
 
@@ -15,29 +29,31 @@ if (( $? != 0 )); then
   # The daemon is down, or the socket refused us. Tell the panel which, so
   # it can offer the right fix (start the daemon vs. join the docker group).
   case "$ids" in
-  *[Pp]ermission\ denied*) daemon="noaccess" ;;
-  *) daemon="stopped" ;;
+  *[Pp]ermission\ denied*) emit_bare true noaccess ;;
+  *) emit_bare true stopped ;;
   esac
-  printf '{"installed":true,"daemon":"%s","containers":[]}\n' "$daemon"
   exit 0
 fi
 
-if [[ -z $ids ]]; then
-  echo '{"installed":true,"daemon":"running","containers":[]}'
-  exit 0
+df=null
+if (( verbose )); then
+  df=$(docker system df --format '{{json .}}' 2>/dev/null \
+    | jq -sc 'map({type: .Type, reclaimable: .Reclaimable})')
+  [[ -z $df ]] && df=null
 fi
 
-# One inspect call for every container. IDs are hex from docker itself, so
-# the unquoted expansion only ever word-splits on the newlines between them.
-# shellcheck disable=SC2086
-docker inspect $ids 2>/dev/null | jq -c '{
-  installed: true,
-  daemon: "running",
-  containers: map({
+containers='[]'
+if [[ -n $ids ]]; then
+  # One inspect call for every container. IDs are hex from docker itself, so
+  # the unquoted expansion only ever word-splits on the newlines between them.
+  # shellcheck disable=SC2086
+  containers=$(docker inspect $ids 2>/dev/null | jq -c 'map({
     id: .Id[0:12],
     name: (.Name | ltrimstr("/")),
     service: (.Config.Labels["com.docker.compose.service"] // ""),
     project: (.Config.Labels["com.docker.compose.project"] // ""),
+    workingDir: (.Config.Labels["com.docker.compose.project.working_dir"] // ""),
+    configFiles: (.Config.Labels["com.docker.compose.project.config_files"] // ""),
     image: .Config.Image,
     state: .State.Status,
     health: (if .State.Status == "running" then (.State.Health.Status // "") else "" end),
@@ -48,5 +64,9 @@ docker inspect $ids 2>/dev/null | jq -c '{
               | select((.HostPort // "") != "")
               | {host: .HostPort, container: $cport} ]
             | unique)
-  })
-}'
+  })') || containers='[]'
+  [[ -z $containers ]] && containers='[]'
+fi
+
+jq -nc --arg autostart "$autostart" --argjson df "$df" --argjson containers "$containers" \
+  '{installed: true, daemon: "running", autostart: $autostart, df: $df, containers: $containers}'

@@ -6,17 +6,31 @@ Docker containers and compose stacks on the [Omarchy](https://omarchy.org) bar.
 
 A whale in the status bar, a control panel one click away:
 
-- **Compose stacks** — containers grouped by `com.docker.compose.project`,
-  with one-click start/stop for the whole stack.
-- **Per-container controls** — start, stop, restart, unpause.
+- **Compose stacks** — containers grouped by `com.docker.compose.project`.
+  Stack start runs `docker compose up -d` (recreates removed containers,
+  picks up compose.yml changes); stack stop is a plain `docker stop`, never
+  a destructive `down`.
+- **Per-container controls** — start, stop, restart, unpause, and remove
+  (stopped containers only, behind a confirm dialog).
+- **Logs and shell** — one click opens a floating terminal with
+  `docker logs -f` or an interactive `docker exec` shell.
+- **CPU/memory per container** — sampled with `docker stats` while the
+  panel is open; the closed widget costs nothing.
+- **Clickable ports** — a published port opens `http://localhost:<port>`
+  in the browser.
 - **Live updates** — the panel follows `docker events`, so work done in a
   terminal (compose up, stops, health flips) shows up immediately.
-- **Health at a glance** — unhealthy containers turn urgent in the panel and
-  put a badge dot on the bar icon.
+- **Health at a glance** — unhealthy containers turn urgent in the panel,
+  put a badge dot on the bar icon, and raise a desktop notification when
+  they flip (can be turned off).
 - **Port-conflict hints** — a stopped container whose published host port is
   held by a running one is told exactly who is squatting on it.
-- **Daemon switch** — start/stop `docker.service` from the panel, authorized
-  through the regular polkit prompt.
+- **Clean up** — see how much space dangling images and build cache hold,
+  and prune them behind a confirm dialog. Stopped containers and volumes
+  are never touched.
+- **Daemon switch and autostart** — start/stop `docker.service` and toggle
+  enable-at-boot from the panel, authorized through the regular polkit
+  prompt.
 
 ## Install
 
@@ -49,9 +63,11 @@ In `~/.config/omarchy/shell.json`, on the widget entry:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `interval` | `10` | Background poll interval in seconds while the panel is closed. Events refresh the panel regardless; this is the safety net. |
+| `showCount` | `false` | Show the number of running containers next to the whale on the bar. |
+| `notifyUnhealthy` | `true` | Desktop notification when a container turns unhealthy. |
 
 ```json
-{ "id": "erruviel.docker", "interval": 30 }
+{ "id": "erruviel.docker", "interval": 30, "showCount": true }
 ```
 
 ## Uninstall
