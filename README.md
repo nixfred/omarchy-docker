@@ -1,4 +1,4 @@
-# omarchy-docker
+# OmiDocker
 
 Docker containers and compose stacks on the [Omarchy](https://omarchy.org) bar.
 

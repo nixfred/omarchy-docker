@@ -478,7 +478,7 @@ Panel {
         // ---------- Hero: whale · status · daemon switch ----------
         PanelHero {
           width: parent.width
-          title: "Docker"
+          title: "OmiDocker"
           meta: root.statusText
           foreground: root.barForeground
           fontFamily: root.fontFamily
