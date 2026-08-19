@@ -66,7 +66,7 @@ Panel {
       var entry = {
         id: c.id,
         name: c.project ? (c.service || c.name) : c.name,
-        image: c.image || "",
+        image: (c.image || "").replace(/:latest$/, ""),
         state: c.state,
         health: c.health || "",
         workingDir: c.workingDir || "",
@@ -185,7 +185,8 @@ Panel {
       if (!lines[i]) continue
       try {
         var s = JSON.parse(lines[i])
-        if (s.ID) next[s.ID] = { cpu: s.CPUPerc || "", mem: (s.MemUsage || "").split(" /")[0] }
+        // "29.39MiB / 15.5GiB" → "29MiB": the decimals never matter here.
+        if (s.ID) next[s.ID] = { cpu: s.CPUPerc || "", mem: (s.MemUsage || "").split(" /")[0].replace(/\.[0-9]+/, "") }
       } catch (e) {}
     }
     stats = next
@@ -450,7 +451,7 @@ Panel {
     bar: root.bar
     open: root.opened && root.installed
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -801,8 +802,11 @@ Panel {
           onClicked: root.showLogs(row.container)
         }
 
+        // Invisible but space-keeping on stopped rows, so every row has the
+        // same four action slots and the ports column lines up across rows.
         Button {
-          visible: row.running
+          opacity: row.running ? 1 : 0
+          enabled: row.running
           iconText: "󰆍"
           tooltipText: "Shell"
           fontSize: Style.font.caption
