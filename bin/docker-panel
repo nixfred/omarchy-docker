@@ -1,33 +1,146 @@
 #!/bin/bash
-# Emit the whole panel state as one JSON document on stdout — one process
-# spawn per refresh, mirroring how erruviel.wwan feeds its panel. Runs
-# entirely unprivileged: daemon access comes from the user's docker group
-# membership, and this script never elevates.
-#
-# --verbose additionally runs `docker system df` for the clean-up section;
-# only the open panel pays for that.
+# OmiDocker state/action helper. State modes emit exactly one JSON document;
+# action modes stream Docker's native output and preserve its exit status.
 set -o pipefail
 
+docker_bin=${DOCKER_BIN:-docker}
+systemctl_bin=${SYSTEMCTL_BIN:-systemctl}
 verbose=0
-[[ ${1:-} == "--verbose" ]] && verbose=1
+context=""
+action=""
+project_dir=""
+config_files=""
+service=""
+until_filter=""
+target=""
+task_args=()
 
-# Whether docker.service starts at boot; cheap and daemon-independent.
-autostart=$(systemctl is-enabled docker.service 2>/dev/null || true)
+die() {
+  echo "docker-panel: $*" >&2
+  exit 2
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+  --verbose) verbose=1; shift ;;
+  --context) (( $# >= 2 )) || die "--context needs a name"; context=$2; shift 2 ;;
+  --project-directory) (( $# >= 2 )) || die "--project-directory needs a path"; project_dir=$2; shift 2 ;;
+  --config-files) (( $# >= 2 )) || die "--config-files needs a value"; config_files=$2; shift 2 ;;
+  --service) (( $# >= 2 )) || die "--service needs a name"; service=$2; shift 2 ;;
+  --until) (( $# >= 2 )) || die "--until needs a duration"; until_filter=$2; shift 2 ;;
+  --target) (( $# >= 2 )) || die "--target needs a value"; target=$2; shift 2 ;;
+  --prune) action=prune; shift ;;
+  --prune-volumes) action=prune-volumes; shift ;;
+  --pull-redeploy) action=pull-redeploy; shift ;;
+  --compose-validate) action=compose-validate; shift ;;
+  --compose-task) action=compose-task; shift ;;
+  --remove-image) action=remove-image; shift ;;
+  --remove-volume) action=remove-volume; shift ;;
+  --) shift; task_args=("$@"); break ;;
+  *) die "unknown argument: $1" ;;
+  esac
+done
+
+docker_cmd=("$docker_bin")
+[[ -n $context ]] && docker_cmd+=(--context "$context")
+
+docker_run() {
+  "${docker_cmd[@]}" "$@"
+}
+
+compose_command() {
+  local -n result=$1
+  result=("${docker_cmd[@]}" compose --project-directory "$project_dir")
+  local files=()
+  IFS=',' read -r -a files <<< "$config_files"
+  local file
+  for file in "${files[@]}"; do
+    [[ -n $file ]] && result+=(-f "$file")
+  done
+}
+
+if [[ -n $action ]]; then
+  command -v "$docker_bin" >/dev/null 2>&1 || die "Docker CLI is not installed"
+  case "$action" in
+  prune)
+    image_filter=()
+    cache_filter=()
+    if [[ -n $until_filter ]]; then
+      image_filter+=(--filter "until=$until_filter")
+      cache_filter+=(--filter "until=$until_filter")
+    fi
+    docker_run image prune -a -f "${image_filter[@]}" || exit $?
+    docker_run builder prune -a -f "${cache_filter[@]}"
+    ;;
+  prune-volumes)
+    docker_run volume prune -a -f
+    ;;
+  pull-redeploy)
+    [[ -n $project_dir ]] || die "pull/redeploy needs a project directory"
+    compose_command compose_cmd
+    "${compose_cmd[@]}" pull --ignore-buildable || exit $?
+    "${compose_cmd[@]}" up -d
+    ;;
+  compose-validate)
+    [[ -n $project_dir ]] || die "validation needs a project directory"
+    compose_command compose_cmd
+    "${compose_cmd[@]}" config --quiet
+    ;;
+  compose-task)
+    [[ -n $project_dir && -n $service ]] || die "task needs a project directory and service"
+    (( ${#task_args[@]} > 0 )) || die "task command is empty"
+    compose_command compose_cmd
+    "${compose_cmd[@]}" run --rm "$service" "${task_args[@]}"
+    ;;
+  remove-image)
+    [[ -n $target ]] || die "image target is empty"
+    docker_run image rm "$target"
+    ;;
+  remove-volume)
+    [[ -n $target ]] || die "volume target is empty"
+    docker_run volume rm "$target"
+    ;;
+  esac
+  exit $?
+fi
+
+contexts='[]'
+current_context=$context
+if command -v "$docker_bin" >/dev/null 2>&1; then
+  contexts=$("$docker_bin" context ls --format '{{json .}}' 2>/dev/null \
+    | jq -sc 'map({name: .Name, description: .Description, endpoint: .DockerEndpoint,
+                   current: (.Current == true or .Current == "true"), error: .Error})')
+  [[ -n $contexts ]] || contexts='[]'
+  if [[ -z $current_context ]]; then
+    current_context=$("$docker_bin" context show 2>/dev/null || true)
+  fi
+fi
+[[ -n $current_context ]] || current_context=default
+
+endpoint=$(jq -r --arg name "$current_context" '.[] | select(.name == $name) | .endpoint' <<< "$contexts" | head -n1)
+local_context=false
+[[ $endpoint == unix://* || ( $current_context == default && -z $endpoint ) ]] && local_context=true
+
+autostart=""
+if [[ $local_context == true ]]; then
+  autostart=$("$systemctl_bin" is-enabled docker.service 2>/dev/null || true)
+fi
 
 emit_bare() {
   jq -nc --arg installed "$1" --arg daemon "$2" --arg autostart "$autostart" \
-    '{installed: ($installed == "true"), daemon: $daemon, autostart: $autostart, df: null, containers: []}'
+    --arg context "$current_context" --argjson contexts "$contexts" --argjson localContext "$local_context" \
+    '{installed: ($installed == "true"), daemon: $daemon, autostart: $autostart,
+      context: $context, contexts: $contexts, localContext: $localContext,
+      df: null, storage: null, tools: null, containers: []}'
 }
 
-if ! command -v docker >/dev/null 2>&1; then
+if ! command -v "$docker_bin" >/dev/null 2>&1; then
   emit_bare false stopped
   exit 0
 fi
 
-ids=$(docker ps -aq 2>&1)
+ids=$(docker_run ps -aq 2>&1)
 if (( $? != 0 )); then
-  # The daemon is down, or the socket refused us. Tell the panel which, so
-  # it can offer the right fix (start the daemon vs. join the docker group).
   case "$ids" in
   *[Pp]ermission\ denied*) emit_bare true noaccess ;;
   *) emit_bare true stopped ;;
@@ -36,18 +149,47 @@ if (( $? != 0 )); then
 fi
 
 df=null
+storage=null
+tools=null
 if (( verbose )); then
-  df=$(docker system df --format '{{json .}}' 2>/dev/null \
+  df=$(docker_run system df --format '{{json .}}' 2>/dev/null \
     | jq -sc 'map({type: .Type, reclaimable: .Reclaimable})')
-  [[ -z $df ]] && df=null
+  [[ -n $df ]] || df=null
+
+  storage_raw=$(docker_run system df -v --format '{{json .}}' 2>/dev/null || true)
+  if jq -e 'type == "object"' >/dev/null 2>&1 <<< "$storage_raw"; then
+    storage=$(jq -c '{
+      images: [(.Images // [])[] | {
+        id: (.ID | sub("^sha256:"; "") | .[0:12]), repository: .Repository, tag: .Tag,
+        size: .Size, uniqueSize: .UniqueSize, sharedSize: .SharedSize,
+        containers: ((.Containers // "0") | tonumber? // 0), created: .CreatedSince
+      }],
+      volumes: [(.Volumes // [])[] | {
+        name: .Name, driver: .Driver, size: .Size,
+        links: ((.Links // "0") | tonumber? // 0), mountpoint: .Mountpoint,
+        composeProject: ((.Labels // "") | capture("com.docker.compose.project=(?<v>[^,]+)").v? // "")
+      }],
+      buildCache: [(.BuildCache // [])[] | {
+        id: .ID, size: .Size, inUse: .InUse, shared: .Shared, created: .CreatedSince
+      }]
+    }' <<< "$storage_raw")
+  fi
+
+  lazydocker=false; dive=false; trivy=false; scout=false
+  command -v lazydocker >/dev/null 2>&1 && lazydocker=true
+  command -v dive >/dev/null 2>&1 && dive=true
+  command -v trivy >/dev/null 2>&1 && trivy=true
+  client_plugins=$(docker_run info --format '{{json .ClientInfo.Plugins}}' 2>/dev/null || true)
+  jq -e 'any(.[]?; (.Name // "") == "scout")' >/dev/null 2>&1 <<< "$client_plugins" && scout=true
+  tools=$(jq -nc --argjson lazydocker "$lazydocker" --argjson dive "$dive" \
+    --argjson trivy "$trivy" --argjson scout "$scout" \
+    '{lazydocker: $lazydocker, dive: $dive, trivy: $trivy, scout: $scout}')
 fi
 
 containers='[]'
 if [[ -n $ids ]]; then
-  # One inspect call for every container. IDs are hex from docker itself, so
-  # the unquoted expansion only ever word-splits on the newlines between them.
   # shellcheck disable=SC2086
-  containers=$(docker inspect $ids 2>/dev/null | jq -c 'map({
+  containers=$(docker_run inspect $ids 2>/dev/null | jq -c 'map({
     id: .Id[0:12],
     name: (.Name | ltrimstr("/")),
     service: (.Config.Labels["com.docker.compose.service"] // ""),
@@ -55,8 +197,29 @@ if [[ -n $ids ]]; then
     workingDir: (.Config.Labels["com.docker.compose.project.working_dir"] // ""),
     configFiles: (.Config.Labels["com.docker.compose.project.config_files"] // ""),
     image: .Config.Image,
+    imageId: (.Image | sub("^sha256:"; "") | .[0:12]),
+    platform: .Platform,
+    created: .Created,
+    command: ([.Path] + (.Args // []) | join(" ")),
     state: .State.Status,
+    exitCode: .State.ExitCode,
+    oomKilled: .State.OOMKilled,
+    stateError: (.State.Error // ""),
+    startedAt: .State.StartedAt,
+    finishedAt: .State.FinishedAt,
+    restartCount: .RestartCount,
+    restartPolicy: (.HostConfig.RestartPolicy.Name // "no"),
     health: (if .State.Status == "running" then (.State.Health.Status // "") else "" end),
+    healthLog: [(.State.Health.Log // [])[-3:][] | {
+      exitCode: .ExitCode, output: ((.Output // "") | gsub("[\\r\\n]+$"; "") | .[0:240])
+    }],
+    envKeys: [(.Config.Env // [])[] | split("=")[0]] | unique | sort,
+    networks: [(.NetworkSettings.Networks // {}) | to_entries[] | {
+      name: .key, ip: (.value.IPAddress // ""), aliases: (.value.Aliases // [])
+    }],
+    mounts: [(.Mounts // [])[] | {
+      type: .Type, source: .Source, destination: .Destination, rw: .RW
+    }],
     ports: ([ (.HostConfig.PortBindings // {})
               | to_entries[]
               | .key as $cport
@@ -65,8 +228,13 @@ if [[ -n $ids ]]; then
               | {host: .HostPort, container: $cport} ]
             | unique)
   })') || containers='[]'
-  [[ -z $containers ]] && containers='[]'
+  [[ -n $containers ]] || containers='[]'
 fi
 
-jq -nc --arg autostart "$autostart" --argjson df "$df" --argjson containers "$containers" \
-  '{installed: true, daemon: "running", autostart: $autostart, df: $df, containers: $containers}'
+jq -nc --arg autostart "$autostart" --arg context "$current_context" \
+  --argjson contexts "$contexts" --argjson localContext "$local_context" \
+  --argjson df "$df" --argjson storage "$storage" --argjson tools "$tools" \
+  --argjson containers "$containers" \
+  '{installed: true, daemon: "running", autostart: $autostart,
+    context: $context, contexts: $contexts, localContext: $localContext,
+    df: $df, storage: $storage, tools: $tools, containers: $containers}'

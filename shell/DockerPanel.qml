@@ -35,12 +35,25 @@ Panel {
   readonly property bool daemonBusy: daemonProc.running
   readonly property string autostart: info.autostart || ""
   readonly property var dfInfo: info.df || null
+  readonly property var storageInfo: info.storage || ({ images: [], volumes: [], buildCache: [] })
+  readonly property var toolInfo: info.tools || ({ lazydocker: false, dive: false, trivy: false, scout: false })
+  readonly property var contexts: info.contexts || []
+  readonly property bool localContext: info.localContext === true
+  readonly property string effectiveContext: selectedContext || info.context || "default"
 
   readonly property bool showCount: setting("showCount", false) === true
   readonly property bool notifyUnhealthy: setting("notifyUnhealthy", true) !== false
+  readonly property var configuredTasks: setting("tasks", []) || []
 
   // One action in flight at a time; the affected row dims while it runs.
   property string busyId: ""
+  property string actionMessage: ""
+  property bool actionFailed: false
+  property string actionSuccess: ""
+  property string currentView: "containers"
+  property var selectedContainer: null
+  property string selectedContext: ""
+  property string pruneAge: "all"
 
   // Per-container CPU/memory, sampled only while the panel is open.
   property var stats: ({})
@@ -65,12 +78,30 @@ Panel {
       c = conts[i]
       var entry = {
         id: c.id,
+        dockerName: c.name,
         name: c.project ? (c.service || c.name) : c.name,
         image: (c.image || "").replace(/:latest$/, ""),
+        imageId: c.imageId || "",
+        project: c.project || "",
+        service: c.service || "",
         state: c.state,
         health: c.health || "",
         workingDir: c.workingDir || "",
         configFiles: c.configFiles || "",
+        platform: c.platform || "",
+        created: c.created || "",
+        command: c.command || "",
+        exitCode: c.exitCode,
+        oomKilled: c.oomKilled === true,
+        stateError: c.stateError || "",
+        startedAt: c.startedAt || "",
+        finishedAt: c.finishedAt || "",
+        restartCount: c.restartCount || 0,
+        restartPolicy: c.restartPolicy || "no",
+        healthLog: c.healthLog || [],
+        envKeys: c.envKeys || [],
+        networks: c.networks || [],
+        mounts: c.mounts || [],
         portsList: portEntries(c.ports || []),
         note: ""
       }
@@ -111,6 +142,11 @@ Panel {
     for (var i = 0; i < all.length; i++) if (all[i].health === "unhealthy") n++
     return n
   }
+  readonly property int unusedVolumeCount: {
+    var n = 0, volumes = storageInfo.volumes || []
+    for (var i = 0; i < volumes.length; i++) if ((volumes[i].links || 0) === 0) n++
+    return n
+  }
 
   readonly property string statusText: {
     if (daemonBusy) return daemonRunning ? "Stopping Docker…" : "Starting Docker…"
@@ -122,9 +158,10 @@ Panel {
     return s
   }
 
-  // What `docker image prune && docker builder prune` would get back. The
-  // deliberately narrow scope keeps the clean-up away from stopped compose
-  // containers, which around here are parked stacks, not garbage.
+  // What `docker image prune -a && docker builder prune -a` can get back.
+  // `docker system df` reports all images unused by a container, not just
+  // dangling images, so the action must use the same scope as this number.
+  // Stopped compose containers and volumes remain outside the clean-up.
   readonly property string reclaimText: {
     if (!dfInfo) return ""
     var images = "", cache = ""
@@ -161,12 +198,51 @@ Panel {
   }
 
   // -------------------------------------------------------------- refresh ---
+  function contextOptions() {
+    return selectedContext ? ["--context", selectedContext] : []
+  }
+
+  function helperCommand(args) {
+    return [panelScript].concat(contextOptions()).concat(args || [])
+  }
+
+  function dockerCommand(args) {
+    var cmd = ["docker"]
+    if (selectedContext) cmd.push("--context", selectedContext)
+    return cmd.concat(args || [])
+  }
+
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (!statusProc.running) {
+      statusProc.command = helperCommand([])
+      statusProc.running = true
+    }
   }
 
   function refreshDetails() {
-    if (!detailsProc.running) detailsProc.running = true
+    if (!detailsProc.running) {
+      detailsProc.command = helperCommand(["--verbose"])
+      detailsProc.running = true
+    }
+  }
+
+  function selectContext(name) {
+    if (busyId !== "" || daemonBusy || name === effectiveContext) return
+    if (statusProc.running) statusProc.running = false
+    if (detailsProc.running) detailsProc.running = false
+    if (statsProc.running) statsProc.running = false
+    selectedContext = name
+    selectedContainer = null
+    currentView = "containers"
+    info = ({ installed: true, daemon: "stopped", context: name, contexts: contexts, containers: [] })
+    stats = ({})
+    contextRefreshTimer.restart()
+  }
+
+  function showView(name) {
+    currentView = name
+    if (name !== "details") selectedContainer = null
+    scroller.contentY = 0
   }
 
   function updateInfo(raw) {
@@ -174,7 +250,24 @@ Panel {
     // never blinks out while docker is briefly unavailable.
     try {
       var next = JSON.parse(raw)
-      if (next && typeof next === "object") info = next
+      if (next && typeof next === "object") {
+        info = next
+        if (selectedContainer) {
+          var all = next.containers || []
+          var found = false
+          for (var i = 0; i < all.length; i++) {
+            if (all[i].id === selectedContainer.id) {
+              found = true
+              inspectContainer(all[i])
+              break
+            }
+          }
+          if (!found) {
+            selectedContainer = null
+            currentView = "containers"
+          }
+        }
+      }
     } catch (e) {}
   }
 
@@ -193,8 +286,11 @@ Panel {
   }
 
   // -------------------------------------------------------------- actions ---
-  function runAction(cmd) {
+  function runAction(cmd, successText) {
     if (actionProc.running) return
+    actionMessage = ""
+    actionFailed = false
+    actionSuccess = successText || "Action complete."
     actionProc.command = cmd
     actionProc.running = true
   }
@@ -202,8 +298,8 @@ Panel {
   function containerAction(c, action) {
     if (busyId !== "" || daemonBusy || !daemonRunning) return
     busyId = c.id
-    if (action === "start" && c.state === "paused") runAction(["docker", "unpause", c.id])
-    else runAction(["docker", action, c.id])
+    if (action === "start" && c.state === "paused") runAction(dockerCommand(["unpause", c.id]))
+    else runAction(dockerCommand([action, c.id]))
   }
 
   // Stack start goes through compose when the labels carry the project
@@ -217,7 +313,7 @@ Panel {
       for (i = 0; i < stack.containers.length; i++) {
         c = stack.containers[i]
         if (!c.workingDir) continue
-        var cmd = ["docker", "compose", "--project-directory", c.workingDir]
+        var cmd = dockerCommand(["compose", "--project-directory", c.workingDir])
         var files = (c.configFiles || "").split(",")
         for (var f = 0; f < files.length; f++) if (files[f]) cmd.push("-f", files[f])
         cmd.push("up", "-d")
@@ -233,7 +329,7 @@ Panel {
     }
     if (ids.length === 0) return
     busyId = "stack:" + stack.name
-    runAction(["docker", start ? "start" : "stop"].concat(ids))
+    runAction(dockerCommand([start ? "start" : "stop"].concat(ids)))
   }
 
   // Destructive actions share one confirm dialog. Removal is only offered
@@ -241,28 +337,151 @@ Panel {
   // keeps an accidental click from force-killing a live service.
   property var pendingConfirm: null
 
-  function requestConfirm(message, confirmText, cmd, busyKey) {
+  function requestConfirm(message, confirmText, cmd, busyKey, successText) {
     if (busyId !== "" || daemonBusy || !daemonRunning) return
-    pendingConfirm = { message: message, confirmText: confirmText, cmd: cmd, busyKey: busyKey }
+    pendingConfirm = { message: message, confirmText: confirmText, cmd: cmd,
+                       busyKey: busyKey, successText: successText || "Action complete." }
   }
 
   function acceptConfirm() {
     if (!pendingConfirm) return
     busyId = pendingConfirm.busyKey
-    runAction(pendingConfirm.cmd)
+    runAction(pendingConfirm.cmd, pendingConfirm.successText)
     pendingConfirm = null
   }
 
   function requestRemove(c) {
     requestConfirm(
       "Remove container " + c.name + "? Its writable layer is deleted; named volumes are kept.",
-      "Remove", ["docker", "rm", c.id], c.id)
+      "Remove", dockerCommand(["rm", c.id]), c.id, "Container removed.")
   }
 
   function requestPrune() {
+    var age = pruneAge === "all" ? "" : pruneAge
+    var scope = age ? " older than " + age : ""
+    var cmd = helperCommand(["--prune"])
+    if (age) cmd.push("--until", age)
     requestConfirm(
-      "Remove dangling images and build cache? Stopped containers and volumes are kept.",
-      "Clean up", ["bash", "-c", "docker image prune -f && docker builder prune -f"], "prune")
+      "Remove every image unused by a container and unused build cache" + scope + "? Images may need to be downloaded or rebuilt later. Stopped containers and volumes are kept.",
+      "Clean up", cmd, "prune", "Image and build-cache cleanup complete.")
+  }
+
+  function requestVolumePrune() {
+    requestConfirm(
+      "Permanently delete every volume unused by a container? This can erase databases and other durable application data with no built-in recovery.",
+      "Delete volumes", helperCommand(["--prune-volumes"]), "volumes", "Unused volumes deleted.")
+  }
+
+  function requestImageRemove(image) {
+    if (image.containers > 0) return
+    requestConfirm(
+      "Remove image " + image.repository + ":" + image.tag + "? It may need to be downloaded or rebuilt later.",
+      "Remove image", helperCommand(["--remove-image", "--target", image.id]),
+      "image:" + image.id, "Image removed.")
+  }
+
+  function requestVolumeRemove(volume) {
+    if (volume.links > 0) return
+    requestConfirm(
+      "Permanently delete volume " + volume.name + " (" + volume.size + ")? Its data has no built-in recovery.",
+      "Delete volume", helperCommand(["--remove-volume", "--target", volume.name]),
+      "volume:" + volume.name, "Volume deleted.")
+  }
+
+  function stackMetadata(stack) {
+    for (var i = 0; i < stack.containers.length; i++)
+      if (stack.containers[i].workingDir) return stack.containers[i]
+    return null
+  }
+
+  function requestStackUpdate(stack) {
+    var meta = stackMetadata(stack)
+    if (!meta) {
+      actionMessage = "Compose metadata is unavailable for " + stack.name + "."
+      actionFailed = true
+      actionMessageTimer.restart()
+      return
+    }
+    requestConfirm(
+      "Pull current images and recreate changed services in " + stack.name + "? Running services may restart.",
+      "Pull & deploy",
+      helperCommand(["--pull-redeploy", "--project-directory", meta.workingDir,
+                     "--config-files", meta.configFiles || ""]),
+      "stack:" + stack.name, stack.name + " updated and deployed.")
+  }
+
+  function validateStack(stack) {
+    var meta = stackMetadata(stack)
+    if (!meta || busyId !== "") return
+    busyId = "validate:" + stack.name
+    runAction(helperCommand(["--compose-validate", "--project-directory", meta.workingDir,
+                             "--config-files", meta.configFiles || ""]),
+              stack.name + " configuration is valid.")
+  }
+
+  function findStack(project) {
+    for (var i = 0; i < stacks.length; i++) if (stacks[i].name === project) return stacks[i]
+    return null
+  }
+
+  function requestTask(task) {
+    var stack = findStack(task.project || "")
+    var meta = stack ? stackMetadata(stack) : null
+    var args = task.command || []
+    if (typeof args === "string") args = ["sh", "-lc", args]
+    if (!meta || !task.service || !args.length) {
+      actionMessage = "Task " + (task.name || "") + " needs a visible project, service, and command."
+      actionFailed = true
+      actionMessageTimer.restart()
+      return
+    }
+    var cmd = helperCommand(["--compose-task", "--project-directory", meta.workingDir,
+                             "--config-files", meta.configFiles || "", "--service", task.service, "--"])
+                 .concat(args)
+    requestConfirm(
+      "Run " + task.name + " as a one-off " + task.service + " container in " + task.project + "?",
+      "Run task", cmd, "task:" + task.name, task.name + " completed.")
+  }
+
+  function inspectContainer(c) {
+    // Accept both raw helper records and the display records built by grouped.
+    var all = info.containers || []
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].id === c.id) {
+        selectedContainer = all[i]
+        currentView = "details"
+        return
+      }
+    }
+    selectedContainer = c
+    currentView = "details"
+  }
+
+  function networkSummary(c) {
+    var values = [], networks = c && c.networks || []
+    for (var i = 0; i < networks.length; i++)
+      values.push(networks[i].name + (networks[i].ip ? " (" + networks[i].ip + ")" : ""))
+    return values.length ? values.join("\n") : "None"
+  }
+
+  function mountSummary(c) {
+    var values = [], mounts = c && c.mounts || []
+    for (var i = 0; i < mounts.length; i++)
+      values.push(mounts[i].type + ": " + mounts[i].source + " → " + mounts[i].destination
+                  + (mounts[i].rw ? " (rw)" : " (ro)"))
+    return values.length ? values.join("\n") : "None"
+  }
+
+  function healthSummary(c) {
+    var values = [], logs = c && c.healthLog || []
+    for (var i = 0; i < logs.length; i++)
+      values.push("exit " + logs[i].exitCode + ": " + (logs[i].output || "no output"))
+    return values.length ? values.join("\n") : (c && c.health ? c.health : "No health check")
+  }
+
+  function shortTime(value) {
+    if (!value || String(value).indexOf("0001-01-01") === 0) return "—"
+    return String(value).replace("T", " ").replace(/\.[0-9]+Z$/, " UTC")
   }
 
   onOpenedChanged: {
@@ -273,19 +492,54 @@ Panel {
   }
 
   // Flows that open their own UI (floating terminals, the browser) — the
-  // panel gets out of their way first. IDs are docker-issued hex, safe to
-  // splice into the command line.
+  // panel gets out of their way first.
   function runDetached(cmd) {
     root.close()
     if (root.bar) root.bar.run(cmd)
   }
 
+  function shellQuote(value) {
+    return "'" + String(value).replace(/'/g, "'\"'\"'") + "'"
+  }
+
+  function commandString(args) {
+    var parts = []
+    for (var i = 0; i < args.length; i++) parts.push(shellQuote(args[i]))
+    return parts.join(" ")
+  }
+
+  function openTerminal(args) {
+    runDetached("omarchy-launch-floating-terminal-with-presentation " + shellQuote(commandString(args)))
+  }
+
   function showLogs(c) {
-    runDetached("omarchy-launch-floating-terminal-with-presentation 'docker logs --tail 200 -f " + c.id + "'")
+    openTerminal(dockerCommand(["logs", "--tail", "200", "-f", c.id]))
   }
 
   function openShell(c) {
-    runDetached("omarchy-launch-floating-terminal-with-presentation 'docker exec -it " + c.id + " sh'")
+    openTerminal(dockerCommand(["exec", "-it", c.id, "sh"]))
+  }
+
+  function showProcesses(c) {
+    openTerminal(dockerCommand(["top", c.id]))
+  }
+
+  function showChanges(c) {
+    openTerminal(dockerCommand(["diff", c.id]))
+  }
+
+  function showInspect(c) {
+    openTerminal(dockerCommand(["inspect", c.id]))
+  }
+
+  function launchTool(tool, c) {
+    var image = c ? (c.image || c.imageId || "") : ""
+    var prefix = selectedContext ? ["env", "DOCKER_CONTEXT=" + selectedContext] : []
+    if (tool === "lazydocker") {
+      openTerminal(prefix.concat(["lazydocker"]))
+    } else if (tool === "dive" && image) openTerminal(prefix.concat(["dive", image]))
+    else if (tool === "trivy" && image) openTerminal(prefix.concat(["trivy", "image", image]))
+    else if (tool === "scout" && image) openTerminal(dockerCommand(["scout", "quickview", image]))
   }
 
   function openPort(host) {
@@ -295,7 +549,7 @@ Panel {
   // The daemon switch: plain systemctl as the user — polkit prompts through
   // the shell's own agent. No rules or privileged helpers shipped.
   function toggleDaemon() {
-    if (daemonBusy || busyId !== "") return
+    if (daemonBusy || busyId !== "" || !localContext) return
     daemonProc.command = daemonRunning
       ? ["systemctl", "stop", "docker.service", "docker.socket"]
       : ["systemctl", "start", "docker.service"]
@@ -303,7 +557,7 @@ Panel {
   }
 
   function toggleAutostart() {
-    if (autostartProc.running) return
+    if (autostartProc.running || !localContext) return
     autostartProc.command = ["systemctl", autostart === "enabled" ? "disable" : "enable", "docker.service"]
     autostartProc.running = true
   }
@@ -328,16 +582,39 @@ Panel {
 
   Process {
     id: statsProc
-    command: ["docker", "stats", "--no-stream", "--format", "{{json .}}"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.updateStats(text) }
   }
 
   Process {
     id: actionProc
-    onExited: {
+    stdout: StdioCollector { id: actionStdout; waitForEnd: true }
+    stderr: StdioCollector { id: actionStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        root.actionMessage = root.actionSuccess || "Action complete."
+        root.actionFailed = false
+        actionMessageTimer.restart()
+      } else if (exitCode !== 0) {
+        var detail = String(actionStderr.text || actionStdout.text || "").trim().replace(/\s+/g, " ").slice(0, 320)
+        root.actionMessage = detail ? "Action failed: " + detail : "Docker action failed (exit " + exitCode + ")."
+        root.actionFailed = true
+        actionMessageTimer.restart()
+      }
       root.busyId = ""
       root.opened ? root.refreshDetails() : root.refresh()
     }
+  }
+
+  Timer {
+    id: actionMessageTimer
+    interval: 8000
+    onTriggered: root.actionMessage = ""
+  }
+
+  Timer {
+    id: contextRefreshTimer
+    interval: 100
+    onTriggered: root.refreshDetails()
   }
 
   Process {
@@ -356,11 +633,11 @@ Panel {
   Process {
     id: eventsProc
     running: root.daemonRunning
-    command: ["docker", "events", "--format", "{{json .}}", "--filter", "type=container"]
+    command: root.dockerCommand(["events", "--format", "{{json .}}", "--filter", "type=container"])
     stdout: SplitParser {
       onRead: function(data) { root.handleEvent(data) }
     }
-    onExited: root.refresh()
+    onExited: root.opened ? root.refreshDetails() : root.refresh()
   }
 
   function handleEvent(line) {
@@ -394,7 +671,7 @@ Panel {
   }
 
   Timer {
-    interval: 2000
+    interval: 10000
     running: root.opened
     repeat: true
     triggeredOnStart: true
@@ -408,7 +685,12 @@ Panel {
     running: root.opened && root.daemonRunning
     repeat: true
     triggeredOnStart: true
-    onTriggered: if (!statsProc.running) statsProc.running = true
+    onTriggered: {
+      if (!statsProc.running) {
+        statsProc.command = root.dockerCommand(["stats", "--no-stream", "--format", "{{json .}}"])
+        statsProc.running = true
+      }
+    }
   }
 
   // ------------------------------------------------------------------ bar ---
@@ -451,7 +733,7 @@ Panel {
     bar: root.bar
     open: root.opened && root.installed
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(460))
+    contentWidth: panel.fittedContentWidth(Style.space(620))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -479,7 +761,7 @@ Panel {
         PanelHero {
           width: parent.width
           title: "OmiDocker"
-          meta: root.statusText
+          meta: root.statusText + "  ·  " + root.effectiveContext
           foreground: root.barForeground
           fontFamily: root.fontFamily
           iconOpacity: root.daemonRunning ? 1.0 : 0.5
@@ -495,15 +777,82 @@ Panel {
             ToggleSwitch {
               checked: root.daemonBusy ? !root.daemonRunning : root.daemonRunning
               busy: root.daemonBusy
+              enabled: root.localContext
               foreground: root.barForeground
               onToggled: root.toggleDaemon()
             }
           }
         }
 
+        Row {
+          visible: root.contexts.length > 1
+          width: parent.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.contexts
+            Button {
+              required property var modelData
+              text: modelData.name
+              tooltipText: modelData.endpoint || modelData.description || "Docker context"
+              fontSize: Style.font.caption
+              bordered: root.effectiveContext === modelData.name
+              enabled: root.busyId === "" && !root.daemonBusy
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+              onClicked: root.selectContext(modelData.name)
+            }
+          }
+        }
+
+        Row {
+          visible: root.currentView !== "details"
+          width: parent.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: [
+              { id: "containers", label: "Containers" },
+              { id: "storage", label: "Storage" },
+              { id: "tasks", label: "Tasks" },
+              { id: "tools", label: "Tools" }
+            ]
+            Button {
+              required property var modelData
+              text: modelData.label
+              fontSize: Style.font.caption
+              bordered: root.currentView === modelData.id
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+              onClicked: root.showView(modelData.id)
+            }
+          }
+        }
+
+        Button {
+          visible: root.currentView === "details"
+          text: "Back to containers"
+          iconText: "󰁍"
+          fontSize: Style.font.caption
+          bordered: true
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.showView("containers")
+        }
+
+        Text {
+          visible: root.actionMessage !== ""
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: root.actionMessage
+          color: root.actionFailed ? root.urgent : root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
         // ---------- Stacks ----------
         Repeater {
-          model: root.stacks
+          model: root.currentView === "containers" ? root.stacks : []
 
           Column {
             id: stackBlock
@@ -519,31 +868,50 @@ Panel {
 
             Item {
               width: parent.width
-              implicitHeight: Math.max(stackHeader.implicitHeight, stackButton.implicitHeight)
+              implicitHeight: Math.max(stackHeader.implicitHeight, stackActions.implicitHeight)
 
               PanelSectionHeader {
                 id: stackHeader
                 text: stackBlock.modelData.name.toUpperCase()
                       + "  ·  " + stackBlock.upCount + "/" + stackBlock.modelData.containers.length + " up"
                 anchors.left: parent.left
+                anchors.right: stackActions.left
+                anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
                 foreground: root.barForeground
                 fontFamily: root.fontFamily
               }
 
-              Button {
-                id: stackButton
+              Row {
+                id: stackActions
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                iconText: stackBlock.anyUp ? "󰓛" : "󰐊"
-                text: stackBlock.anyUp ? "Stop" : "Start"
-                fontSize: Style.font.caption
-                bordered: true
-                enabled: root.daemonRunning && !stackBlock.stackBusy && root.busyId === ""
-                opacity: stackBlock.stackBusy ? 0.5 : 1
-                foreground: root.barForeground
-                fontFamily: root.fontFamily
-                onClicked: root.stackAction(stackBlock.modelData, !stackBlock.anyUp)
+                spacing: Style.space(5)
+
+                Button {
+                  iconText: "󰚰"
+                  text: "Update"
+                  tooltipText: "Pull images and redeploy changed services"
+                  fontSize: Style.font.caption
+                  bordered: true
+                  enabled: root.daemonRunning && !stackBlock.stackBusy && root.busyId === ""
+                  foreground: root.barForeground
+                  fontFamily: root.fontFamily
+                  onClicked: root.requestStackUpdate(stackBlock.modelData)
+                }
+
+                Button {
+                  id: stackButton
+                  iconText: stackBlock.anyUp ? "󰓛" : "󰐊"
+                  text: stackBlock.anyUp ? "Stop" : "Start"
+                  fontSize: Style.font.caption
+                  bordered: true
+                  enabled: root.daemonRunning && !stackBlock.stackBusy && root.busyId === ""
+                  opacity: stackBlock.stackBusy ? 0.5 : 1
+                  foreground: root.barForeground
+                  fontFamily: root.fontFamily
+                  onClicked: root.stackAction(stackBlock.modelData, !stackBlock.anyUp)
+                }
               }
             }
 
@@ -561,12 +929,12 @@ Panel {
 
         // ---------- Standalone containers ----------
         PanelSeparator {
-          visible: root.standalone.length > 0
+          visible: root.currentView === "containers" && root.standalone.length > 0
           foreground: root.barForeground
         }
 
         Column {
-          visible: root.standalone.length > 0
+          visible: root.currentView === "containers" && root.standalone.length > 0
           width: parent.width
           spacing: Style.space(8)
 
@@ -589,20 +957,24 @@ Panel {
 
         // Down or locked out: say what to do instead of a dead list.
         Text {
-          visible: !root.daemonRunning && !root.daemonBusy && root.daemonState !== "noaccess"
+          visible: root.currentView === "containers" && !root.daemonRunning && !root.daemonBusy && root.daemonState !== "noaccess"
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Docker daemon is stopped — flip the switch to start it."
+          text: root.localContext
+            ? "Docker daemon is stopped — flip the switch to start it."
+            : "Docker context " + root.effectiveContext + " is unreachable. Check its endpoint and remote daemon."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
         }
 
         Text {
-          visible: root.daemonState === "noaccess"
+          visible: root.currentView === "containers" && root.daemonState === "noaccess"
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "The Docker socket refused access. Add yourself to the docker group:\nsudo usermod -aG docker $USER\nthen log out and back in."
+          text: root.localContext
+            ? "The Docker socket refused access. Add yourself to the docker group:\nsudo usermod -aG docker $USER\nthen log out and back in."
+            : "Docker context " + root.effectiveContext + " refused access. Check credentials and remote Docker permissions."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -610,12 +982,12 @@ Panel {
 
         // ---------- Clean up ----------
         PanelSeparator {
-          visible: root.daemonRunning && root.reclaimText !== ""
+          visible: root.currentView === "storage" && root.daemonRunning && root.reclaimText !== ""
           foreground: root.barForeground
         }
 
         Column {
-          visible: root.daemonRunning && root.reclaimText !== ""
+          visible: root.currentView === "storage" && root.daemonRunning && root.reclaimText !== ""
           width: parent.width
           spacing: Style.space(6)
 
@@ -638,7 +1010,7 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               iconText: "󰃢"
               text: "Prune"
-              tooltipText: "Remove dangling images and build cache"
+              tooltipText: "Remove unused images and build cache"
               fontSize: Style.font.caption
               bordered: true
               enabled: root.busyId === ""
@@ -656,12 +1028,432 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
+
+          Row {
+            spacing: Style.space(5)
+
+            Repeater {
+              model: [
+                { id: "24h", label: "24h+" },
+                { id: "168h", label: "7d+" },
+                { id: "720h", label: "30d+" },
+                { id: "all", label: "All" }
+              ]
+              Button {
+                required property var modelData
+                text: modelData.label
+                tooltipText: "Only clean unused data older than this"
+                fontSize: Style.font.caption
+                bordered: root.pruneAge === modelData.id
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.pruneAge = modelData.id
+              }
+            }
+          }
+        }
+
+        // ---------- Storage inventory ----------
+        PanelSeparator {
+          visible: root.currentView === "storage" && root.daemonRunning
+          foreground: root.barForeground
+        }
+
+        Column {
+          visible: root.currentView === "storage" && root.daemonRunning
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSectionHeader {
+            text: "IMAGES  ·  " + (root.storageInfo.images || []).length
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Repeater {
+            model: root.storageInfo.images || []
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: Math.max(imageText.implicitHeight, imageRemove.implicitHeight)
+
+              Column {
+                id: imageText
+                anchors.left: parent.left
+                anchors.right: imageRemove.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideMiddle
+                  text: modelData.repository + ":" + modelData.tag
+                  color: root.barForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  text: modelData.size + "  ·  " + modelData.created + "  ·  "
+                        + modelData.containers + " container" + (modelData.containers === 1 ? "" : "s")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Button {
+                id: imageRemove
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: modelData.containers === 0
+                iconText: "󰆴"
+                tooltipText: "Remove this unused image"
+                bordered: true
+                enabled: root.busyId === ""
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.requestImageRemove(modelData)
+              }
+            }
+          }
+        }
+
+        PanelSeparator {
+          visible: root.currentView === "storage" && root.daemonRunning
+          foreground: root.barForeground
+        }
+
+        Column {
+          visible: root.currentView === "storage" && root.daemonRunning
+          width: parent.width
+          spacing: Style.space(8)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(volumeHeader.implicitHeight, volumePrune.implicitHeight)
+
+            PanelSectionHeader {
+              id: volumeHeader
+              text: "VOLUMES  ·  " + (root.storageInfo.volumes || []).length
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+            }
+
+            Button {
+              id: volumePrune
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.unusedVolumeCount > 0
+              text: "Delete unused (" + root.unusedVolumeCount + ")"
+              iconText: "󰆴"
+              tooltipText: "Permanently delete every unused volume"
+              fontSize: Style.font.caption
+              bordered: true
+              enabled: root.busyId === ""
+              foreground: root.urgent
+              fontFamily: root.fontFamily
+              onClicked: root.requestVolumePrune()
+            }
+          }
+
+          Repeater {
+            model: root.storageInfo.volumes || []
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: Math.max(volumeText.implicitHeight, volumeRemove.implicitHeight)
+
+              Column {
+                id: volumeText
+                anchors.left: parent.left
+                anchors.right: volumeRemove.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  width: parent.width
+                  elide: Text.ElideMiddle
+                  text: modelData.name
+                  color: root.barForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  text: modelData.size + "  ·  " + (modelData.links > 0 ? "in use" : "unused")
+                        + (modelData.composeProject ? "  ·  " + modelData.composeProject : "")
+                  color: modelData.links > 0 ? root.dim : root.urgent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Button {
+                id: volumeRemove
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: modelData.links === 0
+                iconText: "󰆴"
+                tooltipText: "Permanently delete this unused volume"
+                bordered: true
+                enabled: root.busyId === ""
+                foreground: root.urgent
+                fontFamily: root.fontFamily
+                onClicked: root.requestVolumeRemove(modelData)
+              }
+            }
+          }
+
+          Text {
+            visible: (root.storageInfo.buildCache || []).length > 0
+            text: (root.storageInfo.buildCache || []).length + " build-cache record(s)"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // ---------- Compose tasks ----------
+        PanelSeparator {
+          visible: root.currentView === "tasks"
+          foreground: root.barForeground
+        }
+
+        Column {
+          visible: root.currentView === "tasks"
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSectionHeader {
+            text: "COMPOSE CONFIGURATION"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Repeater {
+            model: root.stacks
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: validateButton.implicitHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: validateButton.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: modelData.name
+                color: root.barForeground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+              Button {
+                id: validateButton
+                anchors.right: parent.right
+                text: "Validate"
+                iconText: "󰅖"
+                tooltipText: "Run docker compose config --quiet"
+                fontSize: Style.font.caption
+                bordered: true
+                enabled: root.busyId === ""
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.validateStack(modelData)
+              }
+            }
+          }
+
+          Text {
+            visible: root.stacks.length === 0
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "No Compose stacks are visible in this context."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          PanelSectionHeader {
+            text: "ONE-OFF TASKS"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Repeater {
+            model: root.configuredTasks
+            Item {
+              required property var modelData
+              width: parent.width
+              implicitHeight: taskButton.implicitHeight
+
+              Column {
+                anchors.left: parent.left
+                anchors.right: taskButton.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  text: modelData.name || "Task"
+                  color: root.barForeground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  text: (modelData.project || "project?") + "  ·  " + (modelData.service || "service?")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+              Button {
+                id: taskButton
+                anchors.right: parent.right
+                text: "Run"
+                iconText: "󰐊"
+                fontSize: Style.font.caption
+                bordered: true
+                enabled: root.busyId === ""
+                foreground: root.barForeground
+                fontFamily: root.fontFamily
+                onClicked: root.requestTask(modelData)
+              }
+            }
+          }
+
+          Text {
+            visible: root.configuredTasks.length === 0
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Add tasks to this widget's tasks setting. Commands run through docker compose run --rm after confirmation."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        // ---------- Container inspector ----------
+        Column {
+          visible: root.currentView === "details" && root.selectedContainer !== null
+          width: parent.width
+          spacing: Style.space(9)
+
+          PanelSectionHeader {
+            text: root.selectedContainer ? String(root.selectedContainer.name || "CONTAINER").toUpperCase() : "CONTAINER"
+            foreground: root.barForeground
+            fontFamily: root.fontFamily
+          }
+
+          Row {
+            spacing: Style.space(5)
+            Button { text: "Logs"; iconText: "󰈙"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.showLogs(root.selectedContainer) }
+            Button { text: "Shell"; iconText: "󰆍"; bordered: true; enabled: root.selectedContainer && root.selectedContainer.state === "running"; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.openShell(root.selectedContainer) }
+            Button { text: "Top"; iconText: "󰄬"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.showProcesses(root.selectedContainer) }
+            Button { text: "Diff"; iconText: "󰦓"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.showChanges(root.selectedContainer) }
+            Button { text: "JSON"; iconText: "󰘦"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.showInspect(root.selectedContainer) }
+          }
+
+          Repeater {
+            model: root.selectedContainer ? [
+              { label: "Image", value: root.selectedContainer.image + "  ·  " + root.selectedContainer.imageId, danger: false },
+              { label: "State", value: root.selectedContainer.state + "  ·  exit " + root.selectedContainer.exitCode + (root.selectedContainer.oomKilled ? "  ·  OOM killed" : ""), danger: root.selectedContainer.oomKilled || root.selectedContainer.exitCode !== 0 },
+              { label: "Command", value: root.selectedContainer.command, danger: false },
+              { label: "Restart policy", value: root.selectedContainer.restartPolicy + "  ·  " + root.selectedContainer.restartCount + " restart(s)", danger: false },
+              { label: "Started", value: root.shortTime(root.selectedContainer.startedAt), danger: false },
+              { label: "Finished", value: root.shortTime(root.selectedContainer.finishedAt), danger: false },
+              { label: "Networks", value: root.networkSummary(root.selectedContainer), danger: false },
+              { label: "Mounts", value: root.mountSummary(root.selectedContainer), danger: false },
+              { label: "Environment keys", value: root.selectedContainer.envKeys.length ? root.selectedContainer.envKeys.join(", ") : "None", danger: false },
+              { label: "Health", value: root.healthSummary(root.selectedContainer), danger: root.selectedContainer.health === "unhealthy" }
+            ] : []
+
+            Column {
+              required property var modelData
+              width: parent.width
+              spacing: Style.space(2)
+              Text {
+                text: modelData.label.toUpperCase()
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                width: parent.width
+                wrapMode: Text.WrapAnywhere
+                text: modelData.value || "—"
+                color: modelData.danger ? root.urgent : root.barForeground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
+          }
+
+          Row {
+            visible: root.toolInfo.dive || root.toolInfo.trivy || root.toolInfo.scout
+            spacing: Style.space(5)
+            Button { visible: root.toolInfo.dive; text: "Dive"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.launchTool("dive", root.selectedContainer) }
+            Button { visible: root.toolInfo.trivy; text: "Trivy"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.launchTool("trivy", root.selectedContainer) }
+            Button { visible: root.toolInfo.scout; text: "Scout"; bordered: true; foreground: root.barForeground; fontFamily: root.fontFamily; onClicked: root.launchTool("scout", root.selectedContainer) }
+          }
+        }
+
+        // ---------- Tools and daemon settings ----------
+        PanelSeparator {
+          visible: root.currentView === "tools"
+          foreground: root.barForeground
+        }
+
+        Column {
+          visible: root.currentView === "tools"
+          width: parent.width
+          spacing: Style.space(8)
+
+          PanelSectionHeader { text: "OPTIONAL TOOLS"; foreground: root.barForeground; fontFamily: root.fontFamily }
+
+          Item {
+            width: parent.width
+            implicitHeight: lazydockerButton.implicitHeight
+            Text {
+              anchors.left: parent.left
+              anchors.right: lazydockerButton.left
+              anchors.verticalCenter: parent.verticalCenter
+              text: "LazyDocker  ·  " + (root.toolInfo.lazydocker ? "installed" : "not installed")
+              color: root.toolInfo.lazydocker ? root.barForeground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            Button {
+              id: lazydockerButton
+              anchors.right: parent.right
+              visible: root.toolInfo.lazydocker
+              text: "Open"
+              iconText: "󰆍"
+              bordered: true
+              foreground: root.barForeground
+              fontFamily: root.fontFamily
+              onClicked: root.launchTool("lazydocker", null)
+            }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Image tools: Dive " + (root.toolInfo.dive ? "installed" : "not installed")
+                  + "  ·  Trivy " + (root.toolInfo.trivy ? "installed" : "not installed")
+                  + "  ·  Scout " + (root.toolInfo.scout ? "installed" : "not installed")
+                  + ". Open a container's details to launch an installed image tool."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
         }
 
         // ---------- Autostart ----------
-        PanelSeparator { foreground: root.barForeground }
+        PanelSeparator {
+          visible: root.currentView === "tools" && root.localContext
+          foreground: root.barForeground
+        }
 
         Toggle {
+          visible: root.currentView === "tools" && root.localContext
           width: parent.width
           label: "Start at boot"
           description: "Enable docker.service at system boot"
@@ -792,6 +1584,15 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(4)
 
+        Button {
+          iconText: "󰋼"
+          tooltipText: "Details"
+          fontSize: Style.font.caption
+          foreground: root.barForeground
+          fontFamily: root.fontFamily
+          onClicked: root.inspectContainer(row.container)
+        }
+
         // Logs and shell are flat icons: read-only doors, not state changes.
         Button {
           iconText: "󰈙"
@@ -802,8 +1603,8 @@ Panel {
           onClicked: root.showLogs(row.container)
         }
 
-        // Invisible but space-keeping on stopped rows, so every row has the
-        // same four action slots and the ports column lines up across rows.
+        // Invisible but space-keeping on stopped rows, so every row keeps the
+        // same action geometry and the ports column lines up across rows.
         Button {
           opacity: row.running ? 1 : 0
           enabled: row.running

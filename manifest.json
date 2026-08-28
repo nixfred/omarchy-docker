@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "erruviel.docker",
   "name": "OmiDocker",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "Erruviel",
   "license": "MIT",
   "description": "Docker containers and compose stacks for Omarchy",
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "OmiDocker",
-    "description": "Container status with a popup panel: compose stacks, ports, start/stop controls",
+    "description": "Containers, Compose stacks, storage, tasks, contexts, and Docker tools",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"
