@@ -160,7 +160,7 @@ if (( verbose )); then
   if jq -e 'type == "object"' >/dev/null 2>&1 <<< "$storage_raw"; then
     storage=$(jq -c '{
       images: [(.Images // [])[] | {
-        id: (.ID | sub("^sha256:"; "") | .[0:12]), repository: .Repository, tag: .Tag,
+        id: (.ID | sub("^sha256:"; "")), repository: .Repository, tag: .Tag,
         size: .Size, uniqueSize: .UniqueSize, sharedSize: .SharedSize,
         containers: ((.Containers // "0") | tonumber? // 0), created: .CreatedSince
       }],
@@ -200,7 +200,7 @@ if [[ -n $ids ]]; then
     imageId: (.Image | sub("^sha256:"; "") | .[0:12]),
     platform: .Platform,
     created: .Created,
-    command: ([.Path] + (.Args // []) | join(" ")),
+    command: (.Path // ""),
     state: .State.Status,
     exitCode: .State.ExitCode,
     oomKilled: .State.OOMKilled,

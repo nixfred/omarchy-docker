@@ -39,7 +39,7 @@ Panel {
   readonly property var toolInfo: info.tools || ({ lazydocker: false, dive: false, trivy: false, scout: false })
   readonly property var contexts: info.contexts || []
   readonly property bool localContext: info.localContext === true
-  readonly property string effectiveContext: selectedContext || info.context || "default"
+  readonly property string effectiveContext: selectedContext || info.context || ""
 
   readonly property bool showCount: setting("showCount", false) === true
   readonly property bool notifyUnhealthy: setting("notifyUnhealthy", true) !== false
@@ -199,7 +199,7 @@ Panel {
 
   // -------------------------------------------------------------- refresh ---
   function contextOptions() {
-    return selectedContext ? ["--context", selectedContext] : []
+    return effectiveContext ? ["--context", effectiveContext] : []
   }
 
   function helperCommand(args) {
@@ -207,9 +207,7 @@ Panel {
   }
 
   function dockerCommand(args) {
-    var cmd = ["docker"]
-    if (selectedContext) cmd.push("--context", selectedContext)
-    return cmd.concat(args || [])
+    return ["docker"].concat(contextOptions()).concat(args || [])
   }
 
   function refresh() {
@@ -251,6 +249,9 @@ Panel {
     try {
       var next = JSON.parse(raw)
       if (next && typeof next === "object") {
+        // A process canceled during a context switch can still flush stdout.
+        // Never let that late result replace the state of the displayed context.
+        if (effectiveContext && next.context && next.context !== effectiveContext) return
         info = next
         if (selectedContainer) {
           var all = next.containers || []
@@ -534,7 +535,7 @@ Panel {
 
   function launchTool(tool, c) {
     var image = c ? (c.image || c.imageId || "") : ""
-    var prefix = selectedContext ? ["env", "DOCKER_CONTEXT=" + selectedContext] : []
+    var prefix = effectiveContext ? ["env", "DOCKER_CONTEXT=" + effectiveContext] : []
     if (tool === "lazydocker") {
       openTerminal(prefix.concat(["lazydocker"]))
     } else if (tool === "dive" && image) openTerminal(prefix.concat(["dive", image]))
@@ -543,7 +544,7 @@ Panel {
   }
 
   function openPort(host) {
-    runDetached("xdg-open http://localhost:" + host)
+    runDetached("xdg-open " + shellQuote("http://localhost:" + host))
   }
 
   // The daemon switch: plain systemctl as the user — polkit prompts through

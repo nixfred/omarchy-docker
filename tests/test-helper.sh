@@ -28,7 +28,7 @@ case "${1:-} ${2:-} ${3:-}" in
   ;;
 "info --format ") echo '[]' ;;
 "inspect abc123 ")
-  echo '[{"Id":"abc123abc123abc123","Name":"/web","Image":"sha256:111111111111aaaaaaaa","Platform":"linux","Created":"2026-01-01T00:00:00Z","Path":"/app","Args":["serve"],"Config":{"Image":"demo:latest","Env":["TOKEN=hidden","PORT=80"],"Labels":{"com.docker.compose.project":"demo","com.docker.compose.service":"web","com.docker.compose.project.working_dir":"/tmp/project with spaces","com.docker.compose.project.config_files":"/tmp/project with spaces/compose.yml"}},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"},"PortBindings":{}},"State":{"Status":"running","ExitCode":0,"OOMKilled":false,"Error":"","StartedAt":"2026-01-01T00:00:01Z","FinishedAt":"0001-01-01T00:00:00Z","Health":{"Status":"healthy","Log":[]}},"RestartCount":1,"NetworkSettings":{"Networks":{"default":{"IPAddress":"172.20.0.2","Aliases":["web"]}}},"Mounts":[{"Type":"volume","Source":"/source","Destination":"/data","RW":true}]}]'
+  echo '[{"Id":"abc123abc123abc123","Name":"/web","Image":"sha256:111111111111aaaaaaaa","Platform":"linux","Created":"2026-01-01T00:00:00Z","Path":"/app","Args":["serve","--token=command-secret"],"Config":{"Image":"demo:latest","Env":["TOKEN=hidden","PORT=80"],"Labels":{"com.docker.compose.project":"demo","com.docker.compose.service":"web","com.docker.compose.project.working_dir":"/tmp/project with spaces","com.docker.compose.project.config_files":"/tmp/project with spaces/compose.yml"}},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"},"PortBindings":{}},"State":{"Status":"running","ExitCode":0,"OOMKilled":false,"Error":"","StartedAt":"2026-01-01T00:00:01Z","FinishedAt":"0001-01-01T00:00:00Z","Health":{"Status":"healthy","Log":[]}},"RestartCount":1,"NetworkSettings":{"Networks":{"default":{"IPAddress":"172.20.0.2","Aliases":["web"]}}},"Mounts":[{"Type":"volume","Source":"/source","Destination":"/data","RW":true}]}]'
   ;;
 "image prune -a") echo 'Total reclaimed space: 20MB' ;;
 "builder prune -a") echo 'Total: 4MB' ;;
@@ -53,10 +53,21 @@ jq -e '.daemon == "running" and .context == "default" and .localContext == true'
 jq -e '.containers[0].project == "demo" and .containers[0].envKeys == ["PORT", "TOKEN"]' >/dev/null <<< "$state"
 jq -e '.containers[0].networks[0].ip == "172.20.0.2" and .containers[0].mounts[0].destination == "/data"' >/dev/null <<< "$state"
 jq -e '.storage.images[0].repository == "demo" and .storage.volumes[0].composeProject == "demo"' >/dev/null <<< "$state"
+jq -e '.storage.images[0].id == "111111111111aaaaaaaa"' >/dev/null <<< "$state"
 if grep -q 'hidden' <<< "$state"; then
   echo "secret environment value leaked into state" >&2
   exit 1
 fi
+if grep -q 'command-secret' <<< "$state"; then
+  echo "secret command argument leaked into state" >&2
+  exit 1
+fi
+jq -e '.containers[0].command == "/app"' >/dev/null <<< "$state"
+
+: > "$log"
+DOCKER_BIN="$test_dir/docker" "$repo/bin/docker-panel" --remove-image \
+  --target '111111111111aaaaaaaa' >/dev/null
+grep -Fq -- 'image rm 111111111111aaaaaaaa' "$log"
 
 : > "$log"
 DOCKER_BIN="$test_dir/docker" "$repo/bin/docker-panel" --context remote --prune --until 168h >/dev/null
